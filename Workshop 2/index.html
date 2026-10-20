@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Attractor Grid — 18 × 12</title>
+  <style>
+    :root {
+      --bg: #f4f2ec;
+      --ink: #111;
+      --att: #1d4ed8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "IBM Plex Mono", "SF Mono", Consolas, monospace;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: none;
+    }
+
+    .controls {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      display: grid;
+      gap: 10px;
+      width: 260px;
+      padding: 12px 14px;
+      background: rgba(244, 242, 236, 0.92);
+      border: 1px solid #111;
+      cursor: default;
+      z-index: 2;
+    }
+
+    .control {
+      display: grid;
+      grid-template-columns: 72px 1fr 36px;
+      align-items: center;
+      gap: 10px;
+      font-size: 12px;
+    }
+
+    .meter {
+      height: 8px;
+      background: #ddd8cc;
+      overflow: hidden;
+    }
+
+    .meter > span {
+      display: block;
+      height: 100%;
+      width: 0%;
+      background: #111;
+    }
+
+    .mic-status,
+    .cam-status {
+      font-size: 11px;
+      color: #555;
+    }
+
+    button.cam-toggle {
+      justify-self: start;
+      padding: 6px 10px;
+      border: 1px solid #111;
+      background: #f4f2ec;
+      color: #111;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    button.cam-toggle[aria-pressed="true"] {
+      background: #111;
+      color: #f4f2ec;
+    }
+
+    .cam-preview {
+      display: none;
+      position: relative;
+      width: 232px;
+      height: 130px;
+      overflow: hidden;
+      border: 1px solid #111;
+      background: #111;
+    }
+
+    .cam-preview.on {
+      display: block;
+    }
+
+    .cam-preview video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+    }
+
+    .control input[type="range"] {
+      width: 100%;
+      margin: 0;
+      accent-color: #111;
+      cursor: pointer;
+    }
+
+    .control .value {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .hint {
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: #555;
+      pointer-events: none;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="field"></canvas>
+  <div class="controls" id="controls">
+    <label class="control">
+      <span>columns</span>
+      <input id="cols" type="range" min="1" max="40" value="18" />
+      <span class="value" id="colsValue">18</span>
+    </label>
+    <label class="control">
+      <span>rows</span>
+      <input id="rows" type="range" min="1" max="30" value="12" />
+      <span class="value" id="rowsValue">12</span>
+    </label>
+    <div class="control">
+      <span>loudness</span>
+      <div class="meter" aria-hidden="true"><span id="loudMeter"></span></div>
+      <span class="value" id="loudValue">0.00</span>
+    </div>
+    <div class="mic-status" id="micStatus">click to enable microphone</div>
+    <button class="cam-toggle" id="camToggle" type="button" aria-pressed="false">enable camera</button>
+    <div class="cam-preview" id="camPreview">
+      <video id="camVideo" playsinline autoplay muted></video>
+    </div>
+    <div class="cam-status" id="camStatus">camera off · mouse moves att</div>
+  </div>
+  <div class="hint">move the cursor or your palm · speak to the mic · louder = 1</div>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+  <script>
+    let COLS = 18;
+    let ROWS = 12;
+    const MAX_ROTATION = Math.PI * 0.72;
+    const MAX_SHIFT = 42;
+    const FALLOFF = 280;
+
+    const canvas = document.getElementById("field");
+    const ctx = canvas.getContext("2d");
+
+    const cells = [];
+    const attractor = { x: 0, y: 0, targetX: 0, targetY: 0, hasPointer: false };
+    const mic = {
+      loudness: 0,
+      analyser: null,
+      data: null,
+      starting: false,
+    };
+    const loudValue = document.getElementById("loudValue");
+    const loudMeter = document.getElementById("loudMeter");
+    const micStatus = document.getElementById("micStatus");
+    const camToggle = document.getElementById("camToggle");
+    const camPreview = document.getElementById("camPreview");
+    const camVideo = document.getElementById("camVideo");
+    const camStatus = document.getElementById("camStatus");
+    const PALM_INDEXES = [0, 5, 9, 13, 17];
+    const cam = {
+      on: false,
+      starting: false,
+      hasPalm: false,
+      hands: null,
+      stream: null,
+      raf: 0,
+    };
+
+    function hash(i, j, salt) {
+      const n = Math.sin(i * 127.1 + j * 311.7 + salt * 74.7) * 43758.5453;
+      return n - Math.floor(n);
+    }
+
+    function signedHash(i, j, salt) {
+      return hash(i, j, salt) * 2 - 1;
+    }
+
+    function layout() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const padX = width * 0.08;
+      const padY = Math.max(height * 0.1, 96);
+      const usableW = width - padX * 2;
+      const usableH = height - padY * 2;
+      const size = Math.min(usableW / COLS, usableH / ROWS);
+      const gridW = size * COLS;
+      const gridH = size * ROWS;
+      const originX = (width - gridW) / 2 + size / 2;
+      const originY = (height - gridH) / 2 + size / 2;
+
+      cells.length = 0;
+      for (let j = 0; j < ROWS; j += 1) {
+        for (let i = 0; i < COLS; i += 1) {
+          const angle = hash(i, j, 3) * Math.PI * 2;
+          cells.push({
+            i,
+            j,
+            restX: originX + i * size,
+            restY: originY + j * size,
+            size,
+            shiftX: Math.cos(angle),
+            shiftY: Math.sin(angle),
+            shiftMag: 0.45 + hash(i, j, 7) * 0.55,
+            rotSign: signedHash(i, j, 11),
+            extraSpin: signedHash(i, j, 19) * 0.55,
+          });
+        }
+      }
+
+      if (!attractor.hasPointer) {
+        attractor.x = width / 2;
+        attractor.y = height / 2;
+        attractor.targetX = attractor.x;
+        attractor.targetY = attractor.y;
+      }
+    }
+
+    function influenceAt(x, y) {
+      const dx = x - attractor.x;
+      const dy = y - attractor.y;
+      const dist = Math.hypot(dx, dy);
+      const t = Math.max(0, 1 - dist / FALLOFF);
+      const influence = t * t * (3 - 2 * t);
+      return { dx, dy, dist, influence };
+    }
+
+    function readLoudness() {
+      if (!mic.analyser || !mic.data) return;
+      mic.analyser.getByteTimeDomainData(mic.data);
+      let sum = 0;
+      for (let i = 0; i < mic.data.length; i += 1) {
+        const centered = (mic.data[i] - 128) / 128;
+        sum += centered * centered;
+      }
+      const rms = Math.sqrt(sum / mic.data.length);
+      const raw = Math.min(1, rms / 0.22);
+      mic.loudness += (raw - mic.loudness) * 0.28;
+      loudValue.textContent = mic.loudness.toFixed(2);
+      loudMeter.style.width = `${mic.loudness * 100}%`;
+    }
+
+    function drawCell(cell) {
+      const { influence, dx, dy } = influenceAt(cell.restX, cell.restY);
+      const amp = mic.loudness;
+      const shiftScale = influence * MAX_SHIFT * cell.shiftMag * amp;
+      const x = cell.restX + cell.shiftX * shiftScale;
+      const y = cell.restY + cell.shiftY * shiftScale;
+
+      const toward = Math.atan2(dy, dx);
+      const rotation =
+        influence * MAX_ROTATION * (cell.rotSign * 0.65 + cell.extraSpin) * amp +
+        influence * toward * 0.18 * amp;
+
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(rotation);
+      ctx.beginPath();
+      ctx.rect(-cell.size / 2, -cell.size / 2, cell.size, cell.size);
+      const redAmt = Math.min(1, influence * amp);
+      const fade = Math.round(255 * (1 - redAmt));
+      ctx.fillStyle = `rgb(255, ${fade}, ${fade})`;
+      ctx.fill();
+      ctx.lineWidth = 1.25;
+      ctx.strokeStyle = "#111";
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawAttractor() {
+      ctx.save();
+      ctx.translate(attractor.x, attractor.y);
+
+      ctx.beginPath();
+      ctx.arc(0, 0, 6, 0, Math.PI * 2);
+      ctx.fillStyle = "#1d4ed8";
+      ctx.fill();
+
+      ctx.font = "11px IBM Plex Mono, SF Mono, Consolas, monospace";
+      ctx.fillStyle = "#1d4ed8";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText("att", 11, 0);
+      ctx.restore();
+    }
+
+    function tick() {
+      readLoudness();
+      attractor.x += (attractor.targetX - attractor.x) * 0.22;
+      attractor.y += (attractor.targetY - attractor.y) * 0.22;
+
+      ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+      for (const cell of cells) drawCell(cell);
+      drawAttractor();
+      requestAnimationFrame(tick);
+    }
+
+    window.addEventListener("pointermove", (event) => {
+      if (event.target.closest("#controls")) return;
+      if (cam.on && cam.hasPalm) return;
+      attractor.hasPointer = true;
+      attractor.targetX = event.clientX;
+      attractor.targetY = event.clientY;
+    });
+
+    const colsInput = document.getElementById("cols");
+    const rowsInput = document.getElementById("rows");
+    const colsValue = document.getElementById("colsValue");
+    const rowsValue = document.getElementById("rowsValue");
+
+    function setGridSize(nextCols, nextRows) {
+      COLS = nextCols;
+      ROWS = nextRows;
+      colsValue.textContent = String(COLS);
+      rowsValue.textContent = String(ROWS);
+      layout();
+    }
+
+    colsInput.addEventListener("input", () => {
+      setGridSize(Number(colsInput.value), ROWS);
+    });
+
+    rowsInput.addEventListener("input", () => {
+      setGridSize(COLS, Number(rowsInput.value));
+    });
+
+    window.addEventListener("resize", layout);
+
+    async function enableMic() {
+      if (mic.analyser || mic.starting) return;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        micStatus.textContent = "microphone not available";
+        return;
+      }
+      mic.starting = true;
+      micStatus.textContent = "requesting microphone…";
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true },
+          video: false,
+        });
+        const context = new AudioContext();
+        if (context.state === "suspended") await context.resume();
+        const source = context.createMediaStreamSource(stream);
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.65;
+        source.connect(analyser);
+        mic.analyser = analyser;
+        mic.data = new Uint8Array(analyser.fftSize);
+        micStatus.textContent = "mic on · louder = 1";
+      } catch (error) {
+        micStatus.textContent = "microphone blocked";
+      } finally {
+        mic.starting = false;
+      }
+    }
+
+    function palmFromLandmarks(landmarks) {
+      let x = 0;
+      let y = 0;
+      for (const index of PALM_INDEXES) {
+        x += landmarks[index].x;
+        y += landmarks[index].y;
+      }
+      const count = PALM_INDEXES.length;
+      return { x: x / count, y: y / count };
+    }
+
+    function onHandsResults(results) {
+      const landmarks = results.multiHandLandmarks && results.multiHandLandmarks[0];
+      if (!landmarks) {
+        cam.hasPalm = false;
+        if (cam.on) camStatus.textContent = "camera on · show a palm";
+        return;
+      }
+      const palm = palmFromLandmarks(landmarks);
+      cam.hasPalm = true;
+      attractor.hasPointer = true;
+      attractor.targetX = (1 - palm.x) * window.innerWidth;
+      attractor.targetY = palm.y * window.innerHeight;
+      camStatus.textContent = "palm tracking att";
+    }
+
+    async function enableCamera() {
+      if (cam.on || cam.starting) return;
+      if (typeof Hands === "undefined") {
+        camStatus.textContent = "hand tracker failed to load";
+        return;
+      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        camStatus.textContent = "camera not available";
+        return;
+      }
+      cam.starting = true;
+      camStatus.textContent = "requesting camera…";
+      try {
+        cam.hands = new Hands({
+          locateFile: (file) =>
+            `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
+        });
+        cam.hands.setOptions({
+          maxNumHands: 1,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.6,
+          minTrackingConfidence: 0.5,
+        });
+        cam.hands.onResults(onHandsResults);
+
+        cam.stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: 640, height: 480 },
+          audio: false,
+        });
+        camVideo.srcObject = cam.stream;
+        await camVideo.play();
+        cam.on = true;
+
+        const detectLoop = async () => {
+          if (!cam.on || !cam.hands) return;
+          if (camVideo.readyState >= 2) {
+            await cam.hands.send({ image: camVideo });
+          }
+          cam.raf = requestAnimationFrame(detectLoop);
+        };
+        detectLoop();
+        camPreview.classList.add("on");
+        camToggle.setAttribute("aria-pressed", "true");
+        camToggle.textContent = "disable camera";
+        camStatus.textContent = "camera on · show a palm";
+      } catch (error) {
+        const name = error && error.name ? error.name : "blocked";
+        camStatus.textContent =
+          name === "NotAllowedError" ? "camera blocked" : `camera: ${name}`;
+        await disableCamera();
+      } finally {
+        cam.starting = false;
+      }
+    }
+
+    async function disableCamera() {
+      cam.on = false;
+      cam.hasPalm = false;
+      camPreview.classList.remove("on");
+      camToggle.setAttribute("aria-pressed", "false");
+      camToggle.textContent = "enable camera";
+      if (cam.raf) {
+        cancelAnimationFrame(cam.raf);
+        cam.raf = 0;
+      }
+      if (cam.hands) {
+        try {
+          cam.hands.close();
+        } catch (error) {
+          /* older builds may not expose close */
+        }
+        cam.hands = null;
+      }
+      if (cam.stream) {
+        for (const track of cam.stream.getTracks()) track.stop();
+        cam.stream = null;
+      }
+      camVideo.srcObject = null;
+      if (camStatus.textContent !== "camera blocked") {
+        camStatus.textContent = "camera off · mouse moves att";
+      }
+    }
+
+    camToggle.addEventListener("click", () => {
+      if (cam.on) disableCamera();
+      else enableCamera();
+    });
+
+    window.addEventListener("pointerdown", enableMic);
+    enableMic();
+
+    layout();
+    tick();
+  </script>
+</body>
+</html>
