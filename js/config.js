@@ -1,0 +1,18 @@
+export const CONFIG = {
+  antCount: 220,
+  antSpeed: 1.35,
+  wanderStrength: 0.28,
+  sensorAngle: 0.55,
+  sensorDistance: 14,
+  turnRate: 0.42,
+  nestRadius: 28,
+  foodPickupRadius: 16,
+  foodGrainCount: 70,
+  pheromoneCell: 4,
+  pheromoneDeposit: 18,
+  pheromoneEvaporate: 0.993,
+  pheromoneDiffuseEvery: 3,
+  pheromoneFollow: 0.9,
+  homeBias: 0.18,
+  clickFoodGrains: 55,
+};
